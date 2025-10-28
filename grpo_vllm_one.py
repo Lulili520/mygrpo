@@ -9,7 +9,7 @@ from tqdm import tqdm
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 model_path = "/root/autodl-tmp/lu/myverl/model/qwen3-1.7b"
-gen_device = 0    # GPU device for generation, don't put it in CUDA_VISIBLE_DEVICES
+gen_device = 0
 beta = 0.04
 all_steps = 1000
 Q_batch_size = 5
@@ -56,7 +56,8 @@ def get_batch():
     data['inputs'] = bytes_to_tensor(dd[1])
     data['rewards'] = bytes_to_tensor(dd[2])
     data['refs'] = bytes_to_tensor(dd[3])
-    if len(dd) == 5: data['gen_logps'] = bytes_to_tensor(dd[4])
+    if len(dd) == 5: 
+        data['gen_logps'] = bytes_to_tensor(dd[4])
     return data
 
 def get_per_token_logps(logits, input_ids):
@@ -98,8 +99,8 @@ def gen_worker(Q, physics_device):
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
     from vllm import LLM, SamplingParams
-    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.5)
-    ref_server_ver = 'tensor'  # don't worry, it will auto switch based on the first upload
+    vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.8)
+    ref_server_ver = 'tensor'
 
     sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
     gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
@@ -194,6 +195,7 @@ def gen_worker(Q, physics_device):
 
                     if compute_gen_logps:
                         zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
+                        
                         zz = [xx.prompt_logprobs[plen:] for xx in zz]
                         gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz])
                         data.append(tensor_to_bytes(gen_logps))
@@ -220,18 +222,19 @@ if __name__ == '__main__':
         p = mp.Process(target=gen_worker, args=(Q, gen_device))
         p.start()
 
-    model = AutoModelForCausalLM.from_pretrained(model_path, 
-            torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
 
     engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, 
                                                 model_parameters=model.parameters())
 
     progress = range(1, all_steps+1)
-    if dist.get_rank() == 0: progress = tqdm(progress)
+    if dist.get_rank() == 0: 
+        progress = tqdm(progress)
     for step in progress:
         batch = get_batch()
         while batch is None:
-            print('waiting for batch...'); time.sleep(10)
+            print('waiting for batch...')
+            time.sleep(10)
             batch = get_batch()
 
         loss = GRPO_step(batch)
