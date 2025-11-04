@@ -7,6 +7,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tqdm import tqdm
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+import wandb
+wandb.login(key="9efc1726c99d48fa6eac568b61462fd994b00afb")
 
 model_path = "/root/autodl-tmp/lu/myverl/model/qwen3-1.7b"
 gen_device = 0
@@ -16,6 +18,7 @@ Q_batch_size = 5
 num_pre_Q = 8
 train_batch_size = 8
 gen_update_steps = 16
+eval_steps = 10
 save_steps = 1000
 compute_gen_logps = True
 clip_param = 0.2
@@ -60,45 +63,12 @@ def get_batch():
         data['gen_logps'] = bytes_to_tensor(dd[4])
     return data
 
-def get_per_token_logps(logits, input_ids):
-    per_token_logps = [] # Use a loop to reduce memory peak.
-    for logits_row, input_ids_row in zip(logits, input_ids):
-        log_probs = logits_row.log_softmax(dim=-1)
-        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-        per_token_logps.append(token_log_prob)
-    return torch.stack(per_token_logps)
-#from kernel.ce_kernel import fast_log_softmax_gather
-#get_per_token_logps = fast_log_softmax_gather
-
-def GRPO_step(batch):
-    prompt_length = batch['plen']
-    inputs = batch['inputs'].to(engine.device)
-    advantages = batch['rewards'].to(engine.device).unsqueeze(1)
-    logits = engine(inputs).logits
-    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-    input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it 
-    per_token_logps = get_per_token_logps(logits, input_ids)
-    per_token_logps = per_token_logps[:,prompt_length-1:]
-    ref_per_token_logps = batch['refs'].to(per_token_logps.device)
-    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-    completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
-    if 'gen_logps' in batch:
-        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
-        clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
-        per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
-    else: 
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
-        assert compute_gen_logps is False
-    per_token_loss = -(per_token_loss - beta * per_token_kl)
-    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-    return loss
-
-
-def gen_worker(Q, physics_device):
+def gen_worker(Q, physics_device, model_update_event=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
     from vllm import LLM, SamplingParams
+
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.8)
     ref_server_ver = 'tensor'
 
@@ -154,25 +124,22 @@ def gen_worker(Q, physics_device):
         return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
 
     def try_update_model():
-        try:
-            new_state_dict = Q.get_nowait()
-            print('[VLLM PROC] recving new model ...')
-            llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
-            llm_model.load_weights(new_state_dict.items())
-            print('[VLLM PROC] model updated')
-            del new_state_dict
-        except:
-            #print('[VLLM PROC] no new model')
-            return
+        while True:
+            try:
+                new_state_dict = Q.get_nowait()
+                print('[VLLM PROC] recving new model ...')
+                llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
+                llm_model.load_weights(new_state_dict.items())
+                print('[VLLM PROC] model updated')
+                del new_state_dict
+                break
+            except:
+                time.sleep(1)
         
     from torch.nn.utils.rnn import pad_sequence
     for it in range(999999999):
-        if it % 3 == 0: try_update_model()
         inputs = random.sample(QAs, Q_batch_size)
-        tic = time.time()
         prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
-        print(f'time: {time.time()-tic:.2f}s    ', 'rewards:', rewards, )
-        if it % 5 == 0: print('answers:', answers[0])
 
         for i, pp in enumerate(prompt_inputs):
             prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
@@ -180,7 +147,9 @@ def gen_worker(Q, physics_device):
             curr_answers = answers[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_ans_ids = ans_token_ids[i*num_pre_Q:(i+1)*num_pre_Q]
             curr_rewards = rewards[i*num_pre_Q:(i+1)*num_pre_Q]
-            if curr_rewards.max() - curr_rewards.min() < 1e-4: continue
+            
+            if curr_rewards.max() - curr_rewards.min() < 1e-4: 
+                continue
 
             if ref_server_ver == 'tensor':
                 curr_rewards = (curr_rewards - curr_rewards.mean()) / (curr_rewards.std() + 1e-4)
@@ -195,37 +164,177 @@ def gen_worker(Q, physics_device):
 
                     if compute_gen_logps:
                         zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
-                        
+
                         zz = [xx.prompt_logprobs[plen:] for xx in zz]
                         gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz])
                         data.append(tensor_to_bytes(gen_logps))
 
                     xdata = make_bytes_list(data)
                     r = requests.post(f"{ref_server}/upload", data=xdata)
-                    if r.content == b'string': ref_server_ver = 'string'
+                    if r.content == b'string': 
+                        ref_server_ver = 'string'
             elif ref_server_ver == 'string':
                 xdata = make_bytes_list([json.dumps({"Q": pp[0], "As": curr_answers}).encode(), 
                                         tensor_to_bytes(curr_rewards)])
                 r = requests.post(f"{ref_server}/upload", data=xdata)
                 if r.content == b'tensor': ref_server_ver = 'tensor'
 
+        # 等待模型更新     
+        try_update_model()
+
+
+def get_per_token_logps(logits, input_ids):
+    per_token_logps = [] # Use a loop to reduce memory peak.
+    for logits_row, input_ids_row in zip(logits, input_ids):
+        log_probs = logits_row.log_softmax(dim=-1)
+        token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        per_token_logps.append(token_log_prob)
+    return torch.stack(per_token_logps)
+
+
+def GRPO_step(batch, step=None):
+    prompt_length = batch['plen']
+    inputs = batch['inputs'].to(engine.device)
+    advantages = batch['rewards'].to(engine.device).unsqueeze(1)
+    logits = engine(inputs).logits
+    logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+    input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it 
+    per_token_logps = get_per_token_logps(logits, input_ids)
+    per_token_logps = per_token_logps[:,prompt_length-1:]
+    ref_per_token_logps = batch['refs'].to(per_token_logps.device)
+    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+    completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
+    if 'gen_logps' in batch:
+        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
+        clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
+        per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
+    else: 
+        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+        assert compute_gen_logps is False
+    per_token_loss = -(per_token_loss - beta * per_token_kl)
+    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+    with torch.no_grad():
+        kl_mean = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        wandb.log({
+            "train/loss": loss.item(),
+            "train/kl_mean": kl_mean.item(),
+            "train/adv_mean": adv_mean.item(),
+            "train/adv_std": adv_std.item(),
+        }, step=step)
+
+    return loss
+
+def eval_gsm8k(step=None):
+    from datasets import load_dataset
+    from math_verify import parse, verify, ExprExtractionConfig
+    import re
+
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    questions = ds["question"][:10]
+    gold_answers = [x.split("####")[-1].strip() for x in ds["answer"]][:10]
+
+
+    system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
+    The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
+    def build_prompts(batch_qs):
+        tips = []
+        for x in batch_qs:
+            tips.append(tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_prompt},
+                 {"role": "user",   "content": x}],
+                tokenize=False, add_generation_prompt=True
+            ))
+        return tips
+
+    # 检验最终答案   
+    def extract_last_number(text):
+        pattern = r'\d+\.\d+|\d+/\d+|\d+'
+        nums = re.findall(pattern, text)
+        return nums[-1] if len(nums) > 0 else None
+
+    # 检验是否符合格式
+    def check_format(text):
+        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
+        think_count = text.count("<think>") + text.count("</think>")
+        answer_count = text.count("<answer>") + text.count("</answer>")
+        return 1 if re.match(pattern, text, re.DOTALL | re.VERBOSE) and think_count == 2 and answer_count == 2 else 0
+    
+    preds = []
+    fmt_hits = []
+
+    N = 10
+    batch_size = 4
+
+    for i in range(0, N, batch_size):
+        qs = questions[i:i+batch_size]
+        prompts = build_prompts(qs)
+        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(engine.device)
+
+        gen_out = engine.module.generate(
+            **enc,
+            do_sample=False, 
+            temperature=None, 
+            top_p=None,
+            max_new_tokens=512,
+            eos_token_id=tokenizer.eos_token_id
+        )
+
+        # 取新生成部分
+        new_tokens = gen_out[:, enc["input_ids"].shape[1]:]
+        out_texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
+        out_texts = [t.strip() for t in out_texts]
+
+        preds.extend(out_texts)
+        fmt_hits.extend([check_format(t) for t in out_texts])
+
+    # 数值核验
+    correct = 0
+    ex_cfg = [ExprExtractionConfig()]
+    for pred, gold in zip(preds, gold_answers):
+        last_num = extract_last_number(pred)
+        if last_num is None:
+            continue
+        try:
+            p_expr = parse(last_num, extraction_config=ex_cfg)
+            g_expr = parse(gold,    extraction_config=ex_cfg)
+            if verify(p_expr, g_expr):
+                correct += 1
+        except Exception:
+            pass
+
+    acc = correct / N
+    format_rate = sum(fmt_hits) / N
+
+    wandb.log({
+        "eval/acc": acc,
+        "eval/format_rate": format_rate,
+        "eval/num_examples": N,
+    }, step=step)
+    engine.module.train()
+
 
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 if __name__ == '__main__':
+
     import deepspeed
     deepspeed.init_distributed()
 
     if dist.get_rank() == 0:
+        wandb.init(project="mygrpo", name="grpo_gsm8k")
         print('\nSTART vLLM generation...\n')
+
+
         mp.set_start_method('spawn', force=True)
         Q = mp.Queue()
         p = mp.Process(target=gen_worker, args=(Q, gen_device))
         p.start()
 
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
-
-    engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, 
-                                                model_parameters=model.parameters())
+    engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, model_parameters=model.parameters())
 
     progress = range(1, all_steps+1)
     if dist.get_rank() == 0: 
@@ -233,16 +342,20 @@ if __name__ == '__main__':
     for step in progress:
         batch = get_batch()
         while batch is None:
-            print('waiting for batch...')
-            time.sleep(10)
             batch = get_batch()
 
-        loss = GRPO_step(batch)
+        loss = GRPO_step(batch, step)
         engine.backward(loss)
         engine.step()
 
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss.item():.6f}")
+
+        if step % eval_steps == 0:
+            dist.barrier()
+            if dist.get_rank() == 0:
+                eval_gsm8k(step)
+            dist.barrier()
 
         if step % gen_update_steps == 0:
             dist.barrier()
@@ -252,6 +365,7 @@ if __name__ == '__main__':
                 Q.put(state_dict)
                 print('[TRAINING PROC] send state_dict ok!')
             dist.barrier()
+
 
         if step % save_steps == 0:
             dist.barrier()
@@ -263,3 +377,4 @@ if __name__ == '__main__':
                 engine.module.save_pretrained(save_name, state_dict=state_dict)
                 tokenizer.save_pretrained(save_name)
             dist.barrier()
+
