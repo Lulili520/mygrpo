@@ -1,2 +1,3 @@
 
-CUDA_VISIBLE_DEVICES=0 python ref_server.py
+export VLLM_USE_V1=0
+CUDA_VISIBLE_DEVICES=1 deepspeed grpo_vllm_one.py

@@ -6,19 +6,21 @@ import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tqdm import tqdm
-os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 import wandb
-wandb.login(key="9efc1726c99d48fa6eac568b61462fd994b00afb")
+import queue
+os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 model_path = "/root/autodl-tmp/lu/myverl/model/qwen3-1.7b"
 gen_device = 0
+
+
 beta = 0.04
 all_steps = 1000
 Q_batch_size = 5
 num_pre_Q = 8
-train_batch_size = 8
-gen_update_steps = 16
-eval_steps = 10
+train_batch_size = 4
+gen_update_steps = 4
+eval_steps = 40
 save_steps = 1000
 compute_gen_logps = True
 clip_param = 0.2
@@ -46,6 +48,8 @@ ds_config = {
     }
 }
 
+CMD_SAMPLE = "sample"
+
 def get_batch():
     try:
         r = requests.get(f"{ref_server}/get").content
@@ -63,24 +67,30 @@ def get_batch():
         data['gen_logps'] = bytes_to_tensor(dd[4])
     return data
 
-def gen_worker(Q, physics_device, model_update_event=None):
+def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_event=None):
     os.environ["CUDA_VISIBLE_DEVICES"] = f'{physics_device}'
     torch.cuda.set_device(0)
     print(f"Generation worker process uses GPU {physics_device}")
+
     from vllm import LLM, SamplingParams
+    from math_verify import parse, verify, ExprExtractionConfig
+    from torch.nn.utils.rnn import pad_sequence
+    from datasets import load_dataset
 
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.8)
-    ref_server_ver = 'tensor'
 
     sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
+    sampling_params_eval = SamplingParams(n=1, temperature=0.9, max_tokens=700)
     gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
 
-    from datasets import load_dataset
-    dataset = load_dataset("openai/gsm8k", "main", split="train")
-    QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset['question'], dataset['answer'])]
+    dataset_train = load_dataset("openai/gsm8k", "main", split="train")
+    dataset_eval = load_dataset("openai/gsm8k", "main", split="test")
+    QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset_train['question'], dataset_train['answer'])]
+    QAs_eval = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset_eval['question'], dataset_eval['answer'])]
     
     system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
     The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
     def gen_answers(prompts):
         tip_text = []
         for x in prompts:
@@ -95,21 +105,21 @@ def gen_worker(Q, physics_device, model_update_event=None):
                 ans_token_ids.append(z.token_ids)
         return answers, ans_token_ids
 
-    from math_verify import parse, verify, ExprExtractionConfig
     def reward_correct(item, answer):
         pattern = r'\d+\.\d+|\d+/\d+|\d+'
         nums = re.findall(pattern, answer) 
-        if len(nums) == 0: return -1.0
+        if len(nums) == 0: 
+            return -1.0
         lastnum = nums[-1]
         ans = parse(lastnum, extraction_config=[ExprExtractionConfig()])
         ground_truth = parse(item["A"], extraction_config=[ExprExtractionConfig()])
         return 1 if verify(ans, ground_truth) else -1
+
     def reward_format(item, answer):
         pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
         think_count = answer.count("<think>") + answer.count("</think>")
         answer_count = answer.count("<answer>") + answer.count("</answer>")
         return 1.25 if re.match(pattern, answer, re.DOTALL | re.VERBOSE) and think_count==2 and answer_count==2 else -1
-
 
     def gen_samples(inputs):
         prompts = [x["Q"] for x in inputs]
@@ -122,36 +132,94 @@ def gen_worker(Q, physics_device, model_update_event=None):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": x}], tokenize=False, add_generation_prompt=True) for x in prompts]
         return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
-
-    def try_update_model():
-        while True:
-            try:
-                new_state_dict = Q.get_nowait()
-                print('[VLLM PROC] recving new model ...')
-                llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
-                llm_model.load_weights(new_state_dict.items())
-                print('[VLLM PROC] model updated')
-                del new_state_dict
-                break
-            except:
-                time.sleep(1)
         
-    from torch.nn.utils.rnn import pad_sequence
-    for it in range(999999999):
-        inputs = random.sample(QAs, Q_batch_size)
-        prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
+    def eval_gsm8k(step=None):
+        questions = dataset_eval["question"][:100]
+        gold_answers = [x.split("####")[-1].strip() for x in dataset_eval["answer"]][:100]
+        
 
-        for i, pp in enumerate(prompt_inputs):
-            prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
-            plen = prompt_ids.shape[1]
-            curr_answers = answers[i*num_pre_Q:(i+1)*num_pre_Q]
-            curr_ans_ids = ans_token_ids[i*num_pre_Q:(i+1)*num_pre_Q]
-            curr_rewards = rewards[i*num_pre_Q:(i+1)*num_pre_Q]
-            
-            if curr_rewards.max() - curr_rewards.min() < 1e-4: 
+        system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
+        The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
+
+        def build_prompts(batch_qs):
+            tips = []
+            for x in batch_qs:
+                tips.append(tokenizer.apply_chat_template(
+                    [{"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": x}],
+                    tokenize=False, add_generation_prompt=True
+                ))
+            return tips
+ 
+        def extract_last_number(text):
+            pattern = r'\d+\.\d+|\d+/\d+|\d+'
+            nums = re.findall(pattern, text)
+            return nums[-1] if len(nums) > 0 else None
+
+        def check_format(text):
+            pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
+            think_count = text.count("<think>") + text.count("</think>")
+            answer_count = text.count("<answer>") + text.count("</answer>")
+            return 1 if re.match(pattern, text, re.DOTALL | re.VERBOSE) and think_count == 2 and answer_count == 2 else 0
+        
+        preds = []
+        fmt_hits = []
+        N = 10
+        batch_size = 2
+        
+
+        for i in range(0, N, batch_size):
+            qs = questions[i:i+batch_size]
+            prompts = build_prompts(qs)
+            voutputs = vllm_gen.generate(prompts, sampling_params_eval, use_tqdm=False)
+            out_texts = [o.outputs[0].text.strip() for o in voutputs]
+            preds.extend(out_texts)
+            fmt_hits.extend([check_format(t) for t in out_texts])
+
+
+        correct = 0
+        ex_cfg = [ExprExtractionConfig()]
+        for pred, gold in zip(preds, gold_answers):
+            last_num = extract_last_number(pred)
+            if last_num is None:
                 continue
+            try:
+                p_expr = parse(last_num, extraction_config=ex_cfg)
+                g_expr = parse(gold,    extraction_config=ex_cfg)
+                if verify(p_expr, g_expr):
+                    correct += 1
+            except Exception:
+                pass
 
-            if ref_server_ver == 'tensor':
+        acc = correct / N
+        format_rate = sum(fmt_hits) / N
+        print(f"[step {step}] eval/acc={acc:.6f}, eval/format_rate={format_rate:.6f}, eval/num_examples={N}")
+        return acc, format_rate, N
+
+    def update_model(state_dict):
+        llm_model = vllm_gen.llm_engine.model_executor.driver_worker.model_runner.model
+        llm_model.load_weights(state_dict.items())
+       
+    while True:
+        try:
+            cmd = Q.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        
+        ctype = cmd.get("type")
+        if ctype == CMD_SAMPLE:
+            inputs = random.sample(QAs, Q_batch_size)
+            prompt_inputs, rewards, answers, ans_token_ids = gen_samples(inputs)
+
+            for i, pp in enumerate(prompt_inputs):
+                prompt_ids = tokenizer(pp, return_tensors="pt", add_special_tokens=False)["input_ids"]
+                plen = prompt_ids.shape[1]
+                curr_answers = answers[i*num_pre_Q:(i+1)*num_pre_Q]
+                curr_ans_ids = ans_token_ids[i*num_pre_Q:(i+1)*num_pre_Q]
+                curr_rewards = rewards[i*num_pre_Q:(i+1)*num_pre_Q]
+                
+                if curr_rewards.max() - curr_rewards.min() < 1e-4: 
+                    continue 
                 curr_rewards = (curr_rewards - curr_rewards.mean()) / (curr_rewards.std() + 1e-4)
                 for ii in range(0, num_pre_Q, train_batch_size):
                     sub_rewards = curr_rewards[ii:ii+train_batch_size]
@@ -171,17 +239,20 @@ def gen_worker(Q, physics_device, model_update_event=None):
 
                     xdata = make_bytes_list(data)
                     r = requests.post(f"{ref_server}/upload", data=xdata)
-                    if r.content == b'string': 
-                        ref_server_ver = 'string'
-            elif ref_server_ver == 'string':
-                xdata = make_bytes_list([json.dumps({"Q": pp[0], "As": curr_answers}).encode(), 
-                                        tensor_to_bytes(curr_rewards)])
-                r = requests.post(f"{ref_server}/upload", data=xdata)
-                if r.content == b'tensor': ref_server_ver = 'tensor'
+        
+        elif ctype == "eval":
+            step = cmd.get("step")
+            acc, format_rate, N = eval_gsm8k(step)
+            result_Q.put({"step": step, "acc": acc, "format_rate": format_rate, "N": N})
+            eval_done_event.set()
 
-        # 等待模型更新     
-        try_update_model()
-
+        
+        elif ctype == "update":
+            state_dict = cmd.get("state_dict")
+            update_model(state_dict)
+            del state_dict
+            update_done_event.set()   
+    
 
 def get_per_token_logps(logits, input_ids):
     per_token_logps = [] # Use a loop to reduce memory peak.
@@ -227,110 +298,26 @@ def GRPO_step(batch, step=None):
 
     return loss
 
-def eval_gsm8k(step=None):
-    from datasets import load_dataset
-    from math_verify import parse, verify, ExprExtractionConfig
-    import re
-
-    ds = load_dataset("openai/gsm8k", "main", split="test")
-    questions = ds["question"][:10]
-    gold_answers = [x.split("####")[-1].strip() for x in ds["answer"]][:10]
 
 
-    system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
-    The reasoning process and answer are enclosed within <think> </think> and<answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."""
-
-    def build_prompts(batch_qs):
-        tips = []
-        for x in batch_qs:
-            tips.append(tokenizer.apply_chat_template(
-                [{"role": "system", "content": system_prompt},
-                 {"role": "user",   "content": x}],
-                tokenize=False, add_generation_prompt=True
-            ))
-        return tips
-
-    # 检验最终答案   
-    def extract_last_number(text):
-        pattern = r'\d+\.\d+|\d+/\d+|\d+'
-        nums = re.findall(pattern, text)
-        return nums[-1] if len(nums) > 0 else None
-
-    # 检验是否符合格式
-    def check_format(text):
-        pattern = r"^<think>.*?</think>[\n ]*<answer>.*?</answer>$"
-        think_count = text.count("<think>") + text.count("</think>")
-        answer_count = text.count("<answer>") + text.count("</answer>")
-        return 1 if re.match(pattern, text, re.DOTALL | re.VERBOSE) and think_count == 2 and answer_count == 2 else 0
-    
-    preds = []
-    fmt_hits = []
-
-    N = 10
-    batch_size = 4
-
-    for i in range(0, N, batch_size):
-        qs = questions[i:i+batch_size]
-        prompts = build_prompts(qs)
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False).to(engine.device)
-
-        gen_out = engine.module.generate(
-            **enc,
-            do_sample=False, 
-            temperature=None, 
-            top_p=None,
-            max_new_tokens=512,
-            eos_token_id=tokenizer.eos_token_id
-        )
-
-        # 取新生成部分
-        new_tokens = gen_out[:, enc["input_ids"].shape[1]:]
-        out_texts = tokenizer.batch_decode(new_tokens, skip_special_tokens=True)
-        out_texts = [t.strip() for t in out_texts]
-
-        preds.extend(out_texts)
-        fmt_hits.extend([check_format(t) for t in out_texts])
-
-    # 数值核验
-    correct = 0
-    ex_cfg = [ExprExtractionConfig()]
-    for pred, gold in zip(preds, gold_answers):
-        last_num = extract_last_number(pred)
-        if last_num is None:
-            continue
-        try:
-            p_expr = parse(last_num, extraction_config=ex_cfg)
-            g_expr = parse(gold,    extraction_config=ex_cfg)
-            if verify(p_expr, g_expr):
-                correct += 1
-        except Exception:
-            pass
-
-    acc = correct / N
-    format_rate = sum(fmt_hits) / N
-
-    wandb.log({
-        "eval/acc": acc,
-        "eval/format_rate": format_rate,
-        "eval/num_examples": N,
-    }, step=step)
-    engine.module.train()
 
 
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 if __name__ == '__main__':
-
     import deepspeed
     deepspeed.init_distributed()
 
     if dist.get_rank() == 0:
-        wandb.init(project="mygrpo", name="grpo_gsm8k")
+        wandb.login(key="9efc1726c99d48fa6eac568b61462fd994b00afb")
+        wandb.init(project="mygrpo", name="grpo_gsm8k_baseline")
+
         print('\nSTART vLLM generation...\n')
-
-
         mp.set_start_method('spawn', force=True)
         Q = mp.Queue()
-        p = mp.Process(target=gen_worker, args=(Q, gen_device))
+        result_Q = mp.Queue()
+        eval_done_event = mp.Event()
+        update_done_event = mp.Event()
+        p = mp.Process(target=gen_worker, args=(Q, result_Q, gen_device, eval_done_event, update_done_event))
         p.start()
 
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
@@ -339,6 +326,8 @@ if __name__ == '__main__':
     progress = range(1, all_steps+1)
     if dist.get_rank() == 0: 
         progress = tqdm(progress)
+        Q.put({"type": CMD_SAMPLE})
+    
     for step in progress:
         batch = get_batch()
         while batch is None:
@@ -347,34 +336,47 @@ if __name__ == '__main__':
         loss = GRPO_step(batch, step)
         engine.backward(loss)
         engine.step()
-
+    
         if dist.get_rank() == 0:
             progress.set_description(f"Loss: {loss.item():.6f}")
-
-        if step % eval_steps == 0:
-            dist.barrier()
-            if dist.get_rank() == 0:
-                eval_gsm8k(step)
-            dist.barrier()
 
         if step % gen_update_steps == 0:
             dist.barrier()
             if dist.get_rank() == 0:
                 print('[TRAINING PROC] sending latest state_dict ...')
+                update_done_event.clear()
                 state_dict = engine.module.state_dict()
-                Q.put(state_dict)
+                Q.put({"type": "update", "state_dict": state_dict})
+                update_done_event.wait()
                 print('[TRAINING PROC] send state_dict ok!')
+                Q.put({"type": CMD_SAMPLE})
             dist.barrier()
 
-
-        if step % save_steps == 0:
+        if step % eval_steps == 0:
             dist.barrier()
             if dist.get_rank() == 0:
-                print('saving model')
-                save_name = f"./step_{step}"
-                state_dict = engine.module.state_dict()
-                state_dict = type(state_dict)({k: v.cpu() for k, v in state_dict.items()})
-                engine.module.save_pretrained(save_name, state_dict=state_dict)
-                tokenizer.save_pretrained(save_name)
+                print('[TRAINING PROC] evaluate ...')
+                eval_done_event.clear()
+                Q.put({"type": "eval", "step": step})
+                eval_done_event.wait()
+                eval_result = result_Q.get()
+                wandb.log({
+                    "eval/acc": eval_result["acc"],
+                    "eval/format_rate": eval_result["format_rate"],
+                    "eval/num_examples": eval_result["N"],
+                }, step=eval_result["step"])
+                print('[TRAINING PROC] evaluate ok!')
             dist.barrier()
+
+
+        # if step % save_steps == 0:
+        #     dist.barrier()
+        #     if dist.get_rank() == 0:
+        #         print('saving model')
+        #         save_name = f"./step_{step}"
+        #         state_dict = engine.module.state_dict()
+        #         state_dict = type(state_dict)({k: v.cpu() for k, v in state_dict.items()})
+        #         engine.module.save_pretrained(save_name, state_dict=state_dict)
+        #         tokenizer.save_pretrained(save_name)
+        #     dist.barrier()
 
