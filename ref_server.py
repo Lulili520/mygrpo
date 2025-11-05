@@ -33,7 +33,7 @@ if __name__ == '__main__':
     import bottle, threading, queue
     os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-    model_path = "/root/autodl-tmp/lu/myverl/model/qwen3-1.7b"
+    model_path = "/root/autodl-tmp/lu/model/qwen3-1.7b"
 
     ref_model = AutoModelForCausalLM.from_pretrained(model_path,
             torch_dtype=torch.bfloat16, _attn_implementation="sdpa").to('cuda')
@@ -60,7 +60,8 @@ if __name__ == '__main__':
     def do_upload():
         dd = request.body.read()
         dd = bytes_list_to_list(dd)
-        if len(dd) not in (3,4): return b'tensor'
+        if len(dd) not in (3,4): 
+            return b'tensor'
         data = {'base': json.loads(dd[0])} 
         data['inputs'] = bytes_to_tensor(dd[1])
         data['rewards'] = bytes_to_tensor(dd[2])
@@ -84,9 +85,11 @@ if __name__ == '__main__':
         prompt_length = d['base']['plen']
         with torch.inference_mode():
             per_token_logps = get_per_token_logps(d['inputs'].to(ref_model.device))
+
         per_token_logps = per_token_logps[:,prompt_length-1:]
         data = [json.dumps(d['base']).encode(), tensor_to_bytes(d['inputs']), 
                 tensor_to_bytes(d['rewards']), tensor_to_bytes(per_token_logps)]
-        if 'gen_logps' in d: data.append(tensor_to_bytes(d['gen_logps']))
+        if 'gen_logps' in d: 
+            data.append(tensor_to_bytes(d['gen_logps']))
         xdata = make_bytes_list(data)
         result_queue.put(xdata)

@@ -10,7 +10,7 @@ import wandb
 import queue
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "/root/autodl-tmp/lu/myverl/model/qwen3-1.7b"
+model_path = "/root/autodl-tmp/lu/model-mlp/qwen3-1.7b-mlp"
 gen_device = 0
 
 
@@ -134,8 +134,8 @@ def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_ev
         return prompts_text, torch.tensor(rewards, dtype=torch.float32), answers, ans_token_ids
         
     def eval_gsm8k(step=None):
-        questions = dataset_eval["question"][:100]
-        gold_answers = [x.split("####")[-1].strip() for x in dataset_eval["answer"]][:100]
+        questions = dataset_eval["question"][:10]
+        gold_answers = [x.split("####")[-1].strip() for x in dataset_eval["answer"]][:10]
         
 
         system_prompt = """You are a helpful assistant. A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The Assistant first thinks about the reasoning process in the mind and then provides the user with the answer.\
@@ -232,11 +232,10 @@ def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_ev
 
                     if compute_gen_logps:
                         zz = vllm_gen.generate(prompt_token_ids=merged_ids.tolist(), sampling_params=gen_logps_sp, use_tqdm=False)
-
                         zz = [xx.prompt_logprobs[plen:] for xx in zz]
                         gen_logps = torch.tensor([[list(x.values())[0].logprob for x in xx] for xx in zz])
                         data.append(tensor_to_bytes(gen_logps))
-
+                    
                     xdata = make_bytes_list(data)
                     r = requests.post(f"{ref_server}/upload", data=xdata)
         
@@ -268,25 +267,62 @@ def GRPO_step(batch, step=None):
     inputs = batch['inputs'].to(engine.device)
     advantages = batch['rewards'].to(engine.device).unsqueeze(1)
     logits = engine(inputs).logits
+    
     logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
     input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it 
     per_token_logps = get_per_token_logps(logits, input_ids)
     per_token_logps = per_token_logps[:,prompt_length-1:]
+
+    ####
+    top16_values, top16_indices = per_token_logps.topk(16, dim=-1)
+    ####
+
     ref_per_token_logps = batch['refs'].to(per_token_logps.device)
-    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+    ####
+    top16_ref_values = torch.gather(ref_per_token_logps, dim=-1, index=top16_indices)
+    ####
+
+    # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+    per_token_kl = torch.exp(top16_ref_values - top16_ref_values) - (top16_ref_values - top16_ref_values) - 1
+
     completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
     if 'gen_logps' in batch:
-        ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
+        
+        ####
+        gen_values = batch['gen_logps'].to(engine.device)
+        top16_gen_values = torch.gather(gen_values, dim=-1, index=top16_indices)
+        ratio = torch.exp(top16_values - top16_gen_values)
+        ####
+
+        # ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
         clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
         per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
     else: 
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
         assert compute_gen_logps is False
-    per_token_loss = -(per_token_loss - beta * per_token_kl)
-    loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+    if step is not None and step <= 500:
+        # 前 500 步：只优化 KL
+        # loss = (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
+        loss = per_token_kl.sum(dim=1) / 16
+        loss = loss.mean()
+    else:
+        # 500 步后：用标准 GRPO 损失
+        per_token_loss = -(per_token_loss - beta * per_token_kl)
+        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        loss = (per_token_loss.sum(dim=1) / 16).mean()
+    
+    from remote_pdb import RemotePdb
+    debugger = RemotePdb('127.0.0.1', 4444)
+    debugger.set_trace()
+
+    
+    # per_token_loss = -(per_token_loss - beta * per_token_kl)
+    # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
     with torch.no_grad():
-        kl_mean = (per_token_kl * completion_mask).sum() / completion_mask.sum()
+        kl_mean = (per_token_kl).sum() / 16
         adv_mean = advantages.mean()
         adv_std = advantages.std()
         wandb.log({
@@ -309,7 +345,7 @@ if __name__ == '__main__':
 
     if dist.get_rank() == 0:
         wandb.login(key="9efc1726c99d48fa6eac568b61462fd994b00afb")
-        wandb.init(project="mygrpo", name="grpo_gsm8k_baseline")
+        wandb.init(project="mygrpo", name="grpo_small_16")
 
         print('\nSTART vLLM generation...\n')
         mp.set_start_method('spawn', force=True)
@@ -321,7 +357,7 @@ if __name__ == '__main__':
         p.start()
 
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, _attn_implementation="sdpa")
-    engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, model_parameters=model.parameters())
+    engine, optimizer, _, _ = deepspeed.initialize(config=ds_config, model=model, model_parameters=model.mlp.parameters())
 
     progress = range(1, all_steps+1)
     if dist.get_rank() == 0: 
