@@ -10,7 +10,7 @@ import wandb
 import queue
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
-model_path = "/root/autodl-tmp/lu/model-mlp/qwen3-1.7b-mlp"
+model_path = "/root/autodl-tmp/lu/model/qwen3-1.7b-mlp"
 gen_device = 0
 
 
@@ -284,7 +284,7 @@ def GRPO_step(batch, step=None):
     ####
 
     # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-    per_token_kl = torch.exp(top16_ref_values - top16_ref_values) - (top16_ref_values - top16_ref_values) - 1
+    per_token_kl = torch.exp(top16_ref_values - top16_values) - (top16_ref_values - top16_values) - 1
 
     completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
     if 'gen_logps' in batch:
@@ -313,10 +313,6 @@ def GRPO_step(batch, step=None):
         # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         loss = (per_token_loss.sum(dim=1) / 16).mean()
     
-    from remote_pdb import RemotePdb
-    debugger = RemotePdb('127.0.0.1', 4444)
-    debugger.set_trace()
-
     
     # per_token_loss = -(per_token_loss - beta * per_token_kl)
     # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()

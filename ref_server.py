@@ -65,7 +65,8 @@ if __name__ == '__main__':
         data = {'base': json.loads(dd[0])} 
         data['inputs'] = bytes_to_tensor(dd[1])
         data['rewards'] = bytes_to_tensor(dd[2])
-        if len(dd) == 4: data['gen_logps'] = bytes_to_tensor(dd[3])
+        if len(dd) == 4: 
+            data['gen_logps'] = bytes_to_tensor(dd[3])
         raw_queue.put(data)
         print('receive', data['inputs'].shape, data['rewards'], 
               data['gen_logps'].shape if 'gen_logps' in data else '')
@@ -85,7 +86,6 @@ if __name__ == '__main__':
         prompt_length = d['base']['plen']
         with torch.inference_mode():
             per_token_logps = get_per_token_logps(d['inputs'].to(ref_model.device))
-
         per_token_logps = per_token_logps[:,prompt_length-1:]
         data = [json.dumps(d['base']).encode(), tensor_to_bytes(d['inputs']), 
                 tensor_to_bytes(d['rewards']), tensor_to_bytes(per_token_logps)]
