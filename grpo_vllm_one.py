@@ -22,7 +22,7 @@ train_batch_size = 4
 gen_update_steps = 4
 eval_steps = 40
 save_steps = 1000
-compute_gen_logps = True
+compute_gen_logps = False
 clip_param = 0.2
 ref_server = "http://localhost:59875"
 from ref_server import tensor_to_bytes, bytes_to_tensor, make_bytes_list, bytes_list_to_list
@@ -79,12 +79,12 @@ def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_ev
 
     vllm_gen = LLM(model=model_path, gpu_memory_utilization=0.8)
 
-    sampling_params = SamplingParams(n=num_pre_Q, temperature=0.9, max_tokens=700)
-    sampling_params_eval = SamplingParams(n=1, temperature=0.9, max_tokens=700)
-    gen_logps_sp = SamplingParams(temperature=0, top_p=1, max_tokens=1, prompt_logprobs=1)
+    sampling_params = SamplingParams(n=num_pre_Q, top_k=16, temperature=0.9, max_tokens=1024)
+    sampling_params_eval = SamplingParams(n=1, top_k=16, temperature=0.9, max_tokens=1024)
+    gen_logps_sp = SamplingParams(top_k=16, temperature=0, max_tokens=1, prompt_logprobs=1)
 
-    dataset_train = load_dataset("openai/gsm8k", "main", split="train")
-    dataset_eval = load_dataset("openai/gsm8k", "main", split="test")
+    dataset_train = load_dataset("/root/autodl-tmp/lu/dataset/gsm8k", "main", split="train")
+    dataset_eval = load_dataset("/root/autodl-tmp/lu/dataset/gsm8k", "main", split="test")
     QAs = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset_train['question'], dataset_train['answer'])]
     QAs_eval = [{'Q':x, 'A':y.split('####')[-1].strip()} for x,y in zip(dataset_eval['question'], dataset_eval['answer'])]
     
@@ -166,7 +166,7 @@ def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_ev
         fmt_hits = []
         N = 10
         batch_size = 2
-        
+
 
         for i in range(0, N, batch_size):
             qs = questions[i:i+batch_size]
@@ -251,12 +251,27 @@ def gen_worker(Q, result_Q, physics_device, eval_done_event=None, update_done_ev
             update_model(state_dict)
             del state_dict
             update_done_event.set()   
-    
 
-def get_per_token_logps(logits, input_ids):
+def get_action_logps(mlp_logits, actions):
+    # mlp_logits [bs, output_len, topk];  actions [bs, output_len]
+    per_action_logp = []
+    for mlp_logits_row, actions_row in zip(mlp_logits, actions):
+        log_probs = mlp_logits_row.log_softmax(dim=-1)
+
+        action_log_probs = torch.gather(log_probs, dim=1, index=actions_row.unsqueeze(1)).squeeze(1)
+        per_action_logp.append(action_log_probs)
+    return torch.stack(per_action_logp)
+
+def get_per_token_logps(logits, input_ids, topk_indices):
     per_token_logps = [] # Use a loop to reduce memory peak.
-    for logits_row, input_ids_row in zip(logits, input_ids):
-        log_probs = logits_row.log_softmax(dim=-1)
+    for logits_row, input_ids_row, topk_indices_row in zip(logits, input_ids, topk_indices):
+        topk_logits = torch.gather(logits_row, dim=-1, index=topk_indices_row)  # [seq_len-1, topk]
+        topk_log_probs = topk_logits.log_softmax(dim=-1)  # [seq_len-1]
+
+        log_probs = logits_row.clone()
+        log_probs.scatter_(dim=-1, index=topk_indices_row, src=topk_log_probs)
+
+        # log_probs = logits_row.log_softmax(dim=-1)
         token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
         per_token_logps.append(token_log_prob)
     return torch.stack(per_token_logps)
@@ -266,59 +281,66 @@ def GRPO_step(batch, step=None):
     prompt_length = batch['plen']
     inputs = batch['inputs'].to(engine.device)
     advantages = batch['rewards'].to(engine.device).unsqueeze(1)
-    logits = engine(inputs).logits
+    out = engine(inputs)
+    
+    logits = out.logits
+    mlp_logits = out.mlp_logits
+    topk_indices = out.mlp_topk_indices
     
     logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+    mlp_logits = mlp_logits[:, :-1, :]
+    topk_indices = topk_indices[:, :-1, :]
     input_ids = inputs[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it 
-    per_token_logps = get_per_token_logps(logits, input_ids)
-    per_token_logps = per_token_logps[:,prompt_length-1:]
 
-    ####
-    top16_values, top16_indices = per_token_logps.topk(16, dim=-1)
-    ####
+    matched_indices = (topk_indices == input_ids.unsqueeze(-1))
+    matched_indices = matched_indices[:,prompt_length-1:, :]  # [bs, output_len, topk]
+    actions = matched_indices.int().argmax(dim=-1)  # [bs, output_len]
 
-    ref_per_token_logps = batch['refs'].to(per_token_logps.device)
+    per_action_logps = get_action_logps(mlp_logits, actions)
+    
+    # per_token_logps = get_per_token_logps(logits, input_ids, topk_indices)
+    # per_token_logps = per_token_logps[:,prompt_length-1:]
 
-    ####
-    top16_ref_values = torch.gather(ref_per_token_logps, dim=-1, index=top16_indices)
-    ####
+    ref_logits = batch['refs'].to(per_action_logps.device)
+    ref_logits = ref_logits[:, :-1, :]
+    ref_logits = ref_logits[:, prompt_length-1:, :] 
+    topk_indices = topk_indices[:, prompt_length-1:, :]
+    ref_topk_logits = torch.gather(ref_logits, dim=-1, index=topk_indices)
 
-    # per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-    per_token_kl = torch.exp(top16_ref_values - top16_values) - (top16_ref_values - top16_values) - 1
+    ref_per_action_logps = get_action_logps(ref_topk_logits, actions)
+
+    # ref_per_token_logps = get_per_token_logps(ref_logits, input_ids, topk_indices)
+    # ref_per_token_logps = ref_per_token_logps[:,prompt_length-1:]
+
+    # ref_per_token_logps = batch['refs'].to(per_token_logps.device)
+    per_token_kl = torch.exp(ref_per_action_logps - per_action_logps) - (ref_per_action_logps - per_action_logps) - 1
+    per_token_safe_kl = torch.where(torch.isfinite(per_token_kl), per_token_kl, torch.zeros_like(per_token_kl))
 
     completion_mask = (inputs[:, prompt_length:] != tokenizer.pad_token_id).int()
     if 'gen_logps' in batch:
-        
-        ####
-        gen_values = batch['gen_logps'].to(engine.device)
-        top16_gen_values = torch.gather(gen_values, dim=-1, index=top16_indices)
-        ratio = torch.exp(top16_values - top16_gen_values)
-        ####
-
-        # ratio = torch.exp(per_token_logps - batch['gen_logps'].to(engine.device))
+        ratio = torch.exp(per_action_logps - batch['gen_logps'].to(engine.device))
         clipped_ratio = torch.clamp(ratio, 1-clip_param, 1+clip_param)
         per_token_loss = torch.min(ratio * advantages, clipped_ratio * advantages)
     else: 
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages
+        per_token_loss = torch.exp(per_action_logps - per_action_logps.detach()) * advantages
         assert compute_gen_logps is False
+        
+    # per_token_loss = -(per_token_loss - beta * per_token_kl)
+    # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
-    if step is not None and step <= 500:
-        # 前 500 步：只优化 KL
-        # loss = (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        loss = per_token_kl.sum(dim=1) / 16
+    if step is not None and step <= 200:
+        loss = (per_token_safe_kl* completion_mask).sum() / completion_mask.sum()
         loss = loss.mean()
     else:
-        # 500 步后：用标准 GRPO 损失
-        per_token_loss = -(per_token_loss - beta * per_token_kl)
-        # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        loss = (per_token_loss.sum(dim=1) / 16).mean()
+        per_token_loss = -(per_token_loss - beta * per_token_safe_kl)
+        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
     
     
     # per_token_loss = -(per_token_loss - beta * per_token_kl)
     # loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
     with torch.no_grad():
-        kl_mean = (per_token_kl).sum() / 16
+        kl_mean = (per_token_kl * completion_mask).sum() / completion_mask.sum()
         adv_mean = advantages.mean()
         adv_std = advantages.std()
         wandb.log({
@@ -341,7 +363,7 @@ if __name__ == '__main__':
 
     if dist.get_rank() == 0:
         wandb.login(key="9efc1726c99d48fa6eac568b61462fd994b00afb")
-        wandb.init(project="mygrpo", name="grpo_small_16")
+        wandb.init(project="mygrpo", name="grpo_small_16_pretrained")
 
         print('\nSTART vLLM generation...\n')
         mp.set_start_method('spawn', force=True)

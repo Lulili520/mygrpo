@@ -40,16 +40,24 @@ if __name__ == '__main__':
     ref_model.eval()
     ref_model.requires_grad_(False)
 
-    def get_per_token_logps(input_ids):
+    def get_per_token_logps(input_ids, topk_indices=None):
         logits = ref_model(input_ids).logits  # (B, L, V)
-        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-        input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
-        per_token_logps = []
-        for logits_row, input_ids_row in zip(logits, input_ids):
-            log_probs = logits_row.log_softmax(dim=-1)
-            token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-            per_token_logps.append(token_log_prob)
-        return torch.stack(per_token_logps)
+        # logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        # input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        # per_token_logps = []
+        # for logits_row, input_ids_row, topk_indices_row in zip(logits, input_ids, topk_indices):
+        #     topk_logits = torch.gather(logits_row, dim=-1, index=topk_indices_row)
+        #     topk_log_probs = topk_logits.log_softmax(dim=-1)
+
+        #     log_probs = logits_row.clone()
+        #     log_probs.scatter_(dim=-1, index=topk_indices_row, src=topk_log_probs)
+
+        #     # log_probs = logits_row.log_softmax(dim=-1)
+        #     token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        #     per_token_logps.append(token_log_prob)
+
+        return logits
+        # return torch.stack(per_token_logps)
 
     raw_queue = queue.LifoQueue()
     result_queue = queue.LifoQueue()
@@ -85,10 +93,12 @@ if __name__ == '__main__':
         d = raw_queue.get()
         prompt_length = d['base']['plen']
         with torch.inference_mode():
-            per_token_logps = get_per_token_logps(d['inputs'].to(ref_model.device))
-        per_token_logps = per_token_logps[:,prompt_length-1:]
+            # per_token_logps = get_per_token_logps(d['inputs'].to(ref_model.device))
+            logits = get_per_token_logps(d['inputs'].to(ref_model.device))
+
+        # per_token_logps = per_token_logps[:,prompt_length-1:]
         data = [json.dumps(d['base']).encode(), tensor_to_bytes(d['inputs']), 
-                tensor_to_bytes(d['rewards']), tensor_to_bytes(per_token_logps)]
+                tensor_to_bytes(d['rewards']), tensor_to_bytes(logits)]
         if 'gen_logps' in d: 
             data.append(tensor_to_bytes(d['gen_logps']))
         xdata = make_bytes_list(data)
